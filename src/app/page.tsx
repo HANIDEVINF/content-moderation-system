@@ -1,122 +1,147 @@
 "use client"
 
-import { useMemo, useState } from "react"
-import { AlertOctagon, CheckCircle2, FileWarning, Lock, MessageSquareText, Radar, Shield, Workflow } from "lucide-react"
+import { useEffect, useMemo, useState } from "react"
+import {
+  AlertOctagon,
+  BarChart3,
+  Brain,
+  CheckCircle2,
+  Database,
+  FileWarning,
+  Loader2,
+  MessageSquareText,
+  Play,
+  Shield,
+  Sparkles,
+} from "lucide-react"
 
-type PolicyKey = "toxicity" | "self_harm" | "privacy" | "fraud" | "violence" | "spam"
-type Finding = {
-  key: PolicyKey
-  label: string
-  score: number
-  matches: string[]
-  action: "allow" | "review" | "block"
+type ModelExport = {
+  model_type: string
+  positive_label: string
+  negative_label: string
+  thresholds: { allow: number; review: number }
+  vocabulary: Record<string, number>
+  weights: {
+    dense1_kernel: number[][]
+    dense1_bias: number[]
+    dense2_kernel: number[][]
+    dense2_bias: number[]
+    out_kernel: number[][]
+    out_bias: number[]
+  }
+  metrics: {
+    dataset: string
+    train_size: number
+    validation_size: number
+    test_size: number
+    vocabulary_size: number
+    accuracy: number
+    precision: number
+    recall: number
+    f1: number
+    epochs_ran: number
+  }
 }
 
 const examples = [
   {
-    label: "Clean Product Review",
+    label: "Safe review",
     text: "The delivery was late, but support helped me quickly and the product works well. I would buy it again.",
   },
   {
-    label: "PII Leak",
-    text: "Here is my customer list: lina@example.com, +1 415 555 2199, and card 4111 1111 1111 1111. Please post it publicly.",
+    label: "Spam prize",
+    text: "WINNER! You have been selected for a free cash prize. Text CLAIM now to receive your reward.",
   },
   {
-    label: "Harassment",
-    text: "You are useless and everyone should spam this person until they disappear from the forum.",
+    label: "Urgent account scam",
+    text: "URGENT: your account has been suspended. Click the secure link and verify your password immediately.",
   },
   {
-    label: "Scam Campaign",
-    text: "Click this urgent prize link and send your password so we can unlock your account bonus today.",
+    label: "Normal support",
+    text: "Hi, can you tell me when my order will arrive? I placed it last week and need the tracking number.",
   },
 ]
 
-const policies: Record<PolicyKey, { label: string; terms: string[]; weight: number; color: string }> = {
-  toxicity: {
-    label: "Toxicity",
-    terms: ["useless", "idiot", "hate", "harass", "spam this person", "disappear"],
-    weight: 28,
-    color: "bg-red-300",
-  },
-  self_harm: {
-    label: "Self Harm",
-    terms: ["kill myself", "self harm", "end my life", "suicide"],
-    weight: 35,
-    color: "bg-purple-300",
-  },
-  privacy: {
-    label: "Privacy",
-    terms: ["password", "card", "customer list", "publicly"],
-    weight: 30,
-    color: "bg-cyan-300",
-  },
-  fraud: {
-    label: "Fraud",
-    terms: ["urgent prize", "unlock your account", "send your password", "bonus today"],
-    weight: 32,
-    color: "bg-orange-300",
-  },
-  violence: {
-    label: "Violence",
-    terms: ["attack", "weapon", "hurt them", "threat"],
-    weight: 34,
-    color: "bg-rose-300",
-  },
-  spam: {
-    label: "Spam",
-    terms: ["click this", "limited offer", "buy now", "free money"],
-    weight: 22,
-    color: "bg-lime-300",
-  },
+function tokenize(text: string) {
+  return text.toLowerCase().match(/[a-z0-9']+/g) || []
 }
 
-function extractRegexMatches(text: string) {
-  const email = text.match(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g) || []
-  const phone = text.match(/\+?\d[\d\s().-]{8,}\d/g) || []
-  const card = text.match(/\b(?:\d[ -]*?){13,16}\b/g) || []
-  return { email, phone, card }
+function relu(values: number[]) {
+  return values.map((value) => Math.max(0, value))
 }
 
-function moderate(text: string): Finding[] {
-  const lower = text.toLowerCase()
-  const regexMatches = extractRegexMatches(text)
+function sigmoid(value: number) {
+  return 1 / (1 + Math.exp(-value))
+}
 
-  return (Object.keys(policies) as PolicyKey[]).map((key) => {
-    const policy = policies[key]
-    const terms = policy.terms.filter((term) => lower.includes(term))
-    const piiBoost = key === "privacy" ? regexMatches.email.length + regexMatches.phone.length + regexMatches.card.length : 0
-    const rawScore = Math.min(99, terms.length * policy.weight + piiBoost * 24)
-    const score = rawScore > 0 ? Math.max(38, rawScore) : 3
-    const action = score >= 75 ? "block" : score >= 38 ? "review" : "allow"
-    const matches = [...terms, ...(key === "privacy" ? [...regexMatches.email, ...regexMatches.phone, ...regexMatches.card] : [])]
-    return { key, label: policy.label, score, matches, action }
+function dense(input: number[], kernel: number[][], bias: number[]) {
+  return bias.map((biasValue, column) => {
+    let sum = biasValue
+    for (let row = 0; row < input.length; row += 1) {
+      sum += input[row] * kernel[row][column]
+    }
+    return sum
   })
 }
 
-function overallAction(findings: Finding[]) {
-  const max = Math.max(...findings.map((finding) => finding.score))
-  if (max >= 75) return "block"
-  if (max >= 38) return "review"
+function vectorize(text: string, vocabulary: Record<string, number>) {
+  const vector = new Array(Object.keys(vocabulary).length).fill(0)
+  for (const token of tokenize(text)) {
+    const index = vocabulary[token]
+    if (index !== undefined) vector[index] += 1
+  }
+  return vector.map((value) => Math.log1p(value))
+}
+
+function predict(text: string, model: ModelExport) {
+  const x = vectorize(text, model.vocabulary)
+  const h1 = relu(dense(x, model.weights.dense1_kernel, model.weights.dense1_bias))
+  const h2 = relu(dense(h1, model.weights.dense2_kernel, model.weights.dense2_bias))
+  const logit = dense(h2, model.weights.out_kernel, model.weights.out_bias)[0]
+  return sigmoid(logit)
+}
+
+function routing(probability: number, thresholds: ModelExport["thresholds"]) {
+  if (probability >= thresholds.review) return "block"
+  if (probability >= thresholds.allow) return "review"
   return "allow"
+}
+
+function actionCopy(action: string) {
+  if (action === "block") return "High model confidence. Block the message and log a moderation event."
+  if (action === "review") return "Borderline confidence. Send to a human moderator with model evidence."
+  return "Low spam/abuse probability. Safe to publish."
 }
 
 export default function Home() {
   const [text, setText] = useState(examples[1].text)
-  const findings = useMemo(() => moderate(text), [text])
-  const action = overallAction(findings)
-  const topFinding = [...findings].sort((a, b) => b.score - a.score)[0]
-  const blocked = findings.filter((finding) => finding.action === "block").length
-  const review = findings.filter((finding) => finding.action === "review").length
+  const [model, setModel] = useState<ModelExport | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [runCount, setRunCount] = useState(1)
+
+  useEffect(() => {
+    fetch("/model/moderation_model.json")
+      .then((response) => response.json())
+      .then((data: ModelExport) => setModel(data))
+      .finally(() => setLoading(false))
+  }, [])
+
+  const probability = useMemo(() => (model ? predict(text, model) : 0), [text, model, runCount])
+  const action = model ? routing(probability, model.thresholds) : "loading"
+  const percent = Math.round(probability * 1000) / 10
+  const tokens = tokenize(text)
+  const knownTokens = model ? tokens.filter((token) => model.vocabulary[token] !== undefined) : []
+  const topTokens = Array.from(new Set(knownTokens)).slice(0, 12)
 
   return (
     <main className="min-h-screen bg-[#0b1018] text-slate-50">
-      <section className="mx-auto grid min-h-screen max-w-7xl gap-8 px-6 py-10 lg:grid-cols-[380px_1fr]">
+      <section className="mx-auto grid min-h-screen max-w-7xl gap-8 px-6 py-10 lg:grid-cols-[390px_1fr]">
         <aside className="rounded-lg border border-white/10 bg-white/[0.04] p-5">
           <div className="mb-6 flex items-center gap-3">
-            <Shield className="h-8 w-8 text-cyan-300" />
+            <Shield className="h-9 w-9 text-cyan-300" />
             <div>
-              <h1 className="text-2xl font-bold">Content Moderation System</h1>
-              <p className="text-sm text-slate-400">Policy scoring for user-generated text.</p>
+              <h1 className="text-2xl font-black">Keras Moderation Model</h1>
+              <p className="text-sm text-slate-400">Real trained neural spam/unsafe text classifier.</p>
             </div>
           </div>
 
@@ -136,94 +161,144 @@ export default function Home() {
             value={text}
             onChange={(event) => setText(event.target.value)}
             className="h-64 w-full resize-none rounded-md border border-white/10 bg-slate-950 p-4 text-sm leading-6 text-slate-100 outline-none transition focus:border-cyan-300/60"
-            placeholder="Paste a user message, review, or chat transcript..."
+            placeholder="Type any message. The trained Keras model runs inference in the browser..."
           />
 
-          <div className="mt-4 rounded-md border border-white/10 bg-slate-950 p-4">
-            <div className="mb-2 flex items-center gap-2 text-sm text-slate-400">
-              <Workflow className="h-4 w-4" />
-              Routing decision
-            </div>
-            <div
-              className={`inline-flex rounded-md px-3 py-2 text-sm font-bold uppercase tracking-wide ${
-                action === "block"
-                  ? "bg-red-300 text-slate-950"
-                  : action === "review"
-                    ? "bg-orange-300 text-slate-950"
-                    : "bg-emerald-300 text-slate-950"
-              }`}
-            >
-              {action}
-            </div>
-          </div>
+          <button
+            onClick={() => setRunCount((value) => value + 1)}
+            disabled={!model}
+            className="mt-4 flex w-full items-center justify-center gap-2 rounded-md bg-cyan-300 px-4 py-3 font-black text-slate-950 disabled:opacity-60"
+          >
+            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+            Run Keras Inference
+          </button>
         </aside>
 
         <section className="space-y-6">
           <div className="grid gap-4 md:grid-cols-4">
             {[
-              ["Top Risk", topFinding.label],
-              ["Risk Score", `${topFinding.score}%`],
-              ["Blocks", String(blocked)],
-              ["Reviews", String(review)],
+              ["Dataset", model?.metrics.dataset || "loading"],
+              ["Test Accuracy", model ? `${(model.metrics.accuracy * 100).toFixed(1)}%` : "..."],
+              ["F1 Score", model ? `${(model.metrics.f1 * 100).toFixed(1)}%` : "..."],
+              ["Vocabulary", model ? String(model.metrics.vocabulary_size) : "..."],
             ].map(([label, value]) => (
               <div key={label} className="rounded-lg border border-white/10 bg-white/[0.04] p-4">
                 <div className="text-sm text-slate-400">{label}</div>
-                <div className="mt-2 text-2xl font-bold text-cyan-200">{value}</div>
+                <div className="mt-2 text-2xl font-black text-cyan-200">{value}</div>
               </div>
             ))}
           </div>
 
-          <div className="rounded-lg border border-white/10 bg-white/[0.04] p-5">
-            <div className="mb-4 flex items-center gap-2">
-              <Radar className="h-5 w-5 text-cyan-300" />
-              <h2 className="text-xl font-semibold">Policy Classifier</h2>
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              {findings.map((finding) => (
-                <div key={finding.key} className="rounded-md border border-white/10 bg-slate-950 p-4">
-                  <div className="mb-3 flex items-center justify-between">
-                    <div className="font-semibold">{finding.label}</div>
-                    <div className="text-sm uppercase tracking-wide text-slate-400">{finding.action}</div>
-                  </div>
-                  <div className="h-3 rounded-full bg-white/10">
-                    <div className={`h-3 rounded-full ${policies[finding.key].color}`} style={{ width: `${finding.score}%` }} />
-                  </div>
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    {finding.matches.length > 0 ? (
-                      finding.matches.slice(0, 4).map((match) => (
-                        <span key={match} className="rounded border border-white/10 bg-white/[0.04] px-2 py-1 text-xs text-slate-300">
-                          {match}
-                        </span>
-                      ))
-                    ) : (
-                      <span className="text-xs text-slate-500">No matching signals</span>
-                    )}
-                  </div>
+          <div className="grid gap-6 lg:grid-cols-[1fr_360px]">
+            <div className="rounded-lg border border-white/10 bg-white/[0.04] p-5">
+              <div className="mb-4 flex items-center gap-2">
+                <Brain className="h-5 w-5 text-cyan-300" />
+                <h2 className="text-xl font-bold">Neural Model Prediction</h2>
+              </div>
+              <div className="rounded-lg border border-white/10 bg-slate-950 p-5">
+                <div className="mb-2 flex items-center justify-between text-sm text-slate-400">
+                  <span>Spam / unsafe probability</span>
+                  <span>{percent}%</span>
                 </div>
-              ))}
+                <div className="h-4 rounded-full bg-white/10">
+                  <div
+                    className={`h-4 rounded-full ${action === "block" ? "bg-red-300" : action === "review" ? "bg-orange-300" : "bg-emerald-300"}`}
+                    style={{ width: `${percent}%` }}
+                  />
+                </div>
+                <div
+                  className={`mt-5 inline-flex rounded-md px-3 py-2 text-sm font-black uppercase tracking-wide ${
+                    action === "block"
+                      ? "bg-red-300 text-slate-950"
+                      : action === "review"
+                        ? "bg-orange-300 text-slate-950"
+                        : "bg-emerald-300 text-slate-950"
+                  }`}
+                >
+                  {action}
+                </div>
+                <p className="mt-4 leading-7 text-slate-300">{actionCopy(action)}</p>
+              </div>
+
+              <div className="mt-5 rounded-lg border border-white/10 bg-slate-950 p-5">
+                <div className="mb-3 flex items-center gap-2 text-sm font-bold text-slate-300">
+                  <MessageSquareText className="h-4 w-4 text-emerald-300" />
+                  Tested message
+                </div>
+                <p className="leading-8 text-slate-200">{text}</p>
+              </div>
+            </div>
+
+            <div className="space-y-6">
+              <div className="rounded-lg border border-white/10 bg-white/[0.04] p-5">
+                <div className="mb-4 flex items-center gap-2">
+                  <BarChart3 className="h-5 w-5 text-emerald-300" />
+                  <h2 className="text-xl font-bold">Training Metrics</h2>
+                </div>
+                {model ? (
+                  <div className="space-y-3 text-sm">
+                    {[
+                      ["Train samples", model.metrics.train_size],
+                      ["Validation samples", model.metrics.validation_size],
+                      ["Test samples", model.metrics.test_size],
+                      ["Precision", `${(model.metrics.precision * 100).toFixed(1)}%`],
+                      ["Recall", `${(model.metrics.recall * 100).toFixed(1)}%`],
+                      ["Epochs", model.metrics.epochs_ran],
+                    ].map(([label, value]) => (
+                      <div key={label} className="flex justify-between rounded-md bg-slate-950 p-3">
+                        <span className="text-slate-400">{label}</span>
+                        <strong>{value}</strong>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-slate-400">Loading exported Keras model...</div>
+                )}
+              </div>
+
+              <div className="rounded-lg border border-white/10 bg-[#f5f2ea] p-5 text-slate-950">
+                <div className="mb-3 flex items-center gap-2 font-black">
+                  <Database className="h-5 w-5" />
+                  Real ML Pipeline
+                </div>
+                <p className="text-sm leading-6 text-slate-700">
+                  The model was trained with Keras on the UCI SMS Spam Collection, exported as weights and vocabulary,
+                  then executed directly in this web app.
+                </p>
+              </div>
             </div>
           </div>
 
           <div className="grid gap-6 lg:grid-cols-[1fr_360px]">
-            <div className="rounded-lg border border-white/10 bg-slate-950 p-5">
+            <div className="rounded-lg border border-white/10 bg-white/[0.04] p-5">
               <div className="mb-4 flex items-center gap-2">
-                <MessageSquareText className="h-5 w-5 text-emerald-300" />
-                <h2 className="text-xl font-semibold">Moderated Message</h2>
+                <Sparkles className="h-5 w-5 text-cyan-300" />
+                <h2 className="text-xl font-bold">Model Evidence</h2>
               </div>
-              <p className="leading-8 text-slate-200">{text}</p>
+              <div className="flex flex-wrap gap-2">
+                {topTokens.length > 0 ? (
+                  topTokens.map((token) => (
+                    <span key={token} className="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1 text-sm text-cyan-100">
+                      {token}
+                    </span>
+                  ))
+                ) : (
+                  <span className="text-slate-400">No vocabulary tokens matched.</span>
+                )}
+              </div>
             </div>
 
-            <div className="rounded-lg border border-white/10 bg-slate-950 p-5">
+            <div className="rounded-lg border border-white/10 bg-white/[0.04] p-5">
               <div className="mb-4 flex items-center gap-2">
                 <FileWarning className="h-5 w-5 text-orange-300" />
-                <h2 className="text-xl font-semibold">Audit Trace</h2>
+                <h2 className="text-xl font-bold">Audit Trace</h2>
               </div>
               <ol className="space-y-3 text-sm text-slate-300">
                 {[
-                  "Normalize text and remove casing noise",
-                  "Run regex detectors for email, phone, and payment patterns",
-                  "Score policy categories with weighted lexical signals",
-                  "Apply routing thresholds for allow, review, or block",
+                  "Tokenize text with the same preprocessing used during training",
+                  "Build log-scaled bag-of-words vector from 1,600-word vocabulary",
+                  "Run Dense(96) -> Dense(32) -> sigmoid exported Keras weights",
+                  "Apply allow/review/block thresholds",
                 ].map((step, index) => (
                   <li key={step} className="flex gap-3">
                     <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-cyan-300 text-xs font-bold text-slate-950">
@@ -239,15 +314,10 @@ export default function Home() {
                     <CheckCircle2 className="h-4 w-4 text-emerald-300" />
                     Safe to publish
                   </>
-                ) : action === "review" ? (
-                  <>
-                    <Lock className="h-4 w-4 text-orange-300" />
-                    Hold for moderator review
-                  </>
                 ) : (
                   <>
                     <AlertOctagon className="h-4 w-4 text-red-300" />
-                    Block and log policy event
+                    Requires moderation action
                   </>
                 )}
               </div>

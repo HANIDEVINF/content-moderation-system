@@ -1,0 +1,29 @@
+{
+  "dataset": "UCI SMS Spam Collection",
+  "dataset_url": "https://archive.ics.uci.edu/static/public/228/sms+spam+collection.zip",
+  "train_size": 3790,
+  "validation_size": 669,
+  "test_size": 1115,
+  "vocabulary_size": 1600,
+  "architecture": [
+    "Dense(96, relu)",
+    "Dropout(0.35)",
+    "Dense(32, relu)",
+    "Dense(1, sigmoid)"
+  ],
+  "accuracy": 0.9910313901345291,
+  "precision": 1.0,
+  "recall": 0.9328859060402684,
+  "f1": 0.9652777777777778,
+  "confusion_matrix": [
+    [
+      966,
+      0
+    ],
+    [
+      10,
+      139
+    ]
+  ],
+  "epochs_ran": 7
+}
