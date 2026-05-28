@@ -157,6 +157,11 @@ export default function Home() {
             ))}
           </div>
 
+          <div className="mb-2 flex items-center gap-2 text-sm font-bold text-cyan-100">
+            <MessageSquareText className="h-4 w-4" />
+            Type your own message here
+          </div>
+
           <textarea
             value={text}
             onChange={(event) => setText(event.target.value)}
