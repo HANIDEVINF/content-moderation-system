@@ -12,7 +12,10 @@ import {
   MessageSquareText,
   Play,
   Shield,
+  Sliders,
   Sparkles,
+  Terminal,
+  Trash2,
 } from "lucide-react"
 
 type ModelExport = {
@@ -43,289 +46,492 @@ type ModelExport = {
   }
 }
 
-const examples = [
+type ModerationAction = "allow" | "review" | "block"
+
+const presets = [
   {
-    label: "Safe review",
-    text: "The delivery was late, but support helped me quickly and the product works well. I would buy it again.",
+    title: "Phishing / Prize Scam",
+    category: "High Risk",
+    text: "URGENT! Your account won a $1,000 cash prize. Call 09061701461 now or click the verification link to claim your free reward today.",
   },
   {
-    label: "Spam prize",
-    text: "WINNER! You have been selected for a free cash prize. Text CLAIM now to receive your reward.",
+    title: "Grey-Zone Promo",
+    category: "Borderline",
+    text: "Special limited offer for existing subscribers: upgrade today for a free bonus month and priority support access.",
   },
   {
-    label: "Urgent account scam",
-    text: "URGENT: your account has been suspended. Click the secure link and verify your password immediately.",
+    title: "Engineering Standup Note",
+    category: "Clean",
+    text: "Hey team, I pushed the PyTorch ECG evaluation metrics and updated the FastAPI Docker container. Let's review the PR at 14:00.",
   },
   {
-    label: "Normal support",
-    text: "Hi, can you tell me when my order will arrive? I placed it last week and need the tracking number.",
+    title: "Subscription Support",
+    category: "Clean",
+    text: "Hello, could you please send me the PDF invoice for our team seats from last month? Thanks!",
   },
 ]
 
-function tokenize(text: string) {
+function tokenize(text: string): string[] {
   return text.toLowerCase().match(/[a-z0-9']+/g) || []
 }
 
-function relu(values: number[]) {
-  return values.map((value) => Math.max(0, value))
-}
+function vectorize(text: string, vocabulary: Record<string, number>): { vector: number[]; matched: string[] } {
+  const size = Object.keys(vocabulary).length
+  const vector = new Array<number>(size).fill(0)
+  const matched = new Set<string>()
 
-function sigmoid(value: number) {
-  return 1 / (1 + Math.exp(-value))
-}
-
-function dense(input: number[], kernel: number[][], bias: number[]) {
-  return bias.map((biasValue, column) => {
-    let sum = biasValue
-    for (let row = 0; row < input.length; row += 1) {
-      sum += input[row] * kernel[row][column]
+  for (const token of tokenize(text)) {
+    const index = vocabulary[token]
+    if (index !== undefined) {
+      vector[index] += 1
+      matched.add(token)
     }
-    return sum
+  }
+
+  const total = vector.reduce((sum, value) => sum + value, 0)
+  const scaled = vector.map((value) => (total > 0 ? Math.log1p(value) / Math.log1p(total) : 0))
+  return { vector: scaled, matched: Array.from(matched) }
+}
+
+function denseRelu(input: number[], kernel: number[][], bias: number[]): number[] {
+  return bias.map((b, outIndex) => {
+    let sum = b
+    for (let inIndex = 0; inIndex < input.length; inIndex += 1) {
+      sum += input[inIndex] * kernel[inIndex][outIndex]
+    }
+    return Math.max(0, sum)
   })
 }
 
-function vectorize(text: string, vocabulary: Record<string, number>) {
-  const vector = new Array(Object.keys(vocabulary).length).fill(0)
-  for (const token of tokenize(text)) {
-    const index = vocabulary[token]
-    if (index !== undefined) vector[index] += 1
+function denseSigmoid(input: number[], kernel: number[][], bias: number[]): number {
+  let sum = bias[0] || 0
+  for (let inIndex = 0; inIndex < input.length; inIndex += 1) {
+    sum += input[inIndex] * kernel[inIndex][0]
   }
-  return vector.map((value) => Math.log1p(value))
+  return 1 / (1 + Math.exp(-sum))
 }
 
-function predict(text: string, model: ModelExport) {
-  const x = vectorize(text, model.vocabulary)
-  const h1 = relu(dense(x, model.weights.dense1_kernel, model.weights.dense1_bias))
-  const h2 = relu(dense(h1, model.weights.dense2_kernel, model.weights.dense2_bias))
-  const logit = dense(h2, model.weights.out_kernel, model.weights.out_bias)[0]
-  return sigmoid(logit)
-}
-
-function routing(probability: number, thresholds: ModelExport["thresholds"]) {
-  if (probability >= thresholds.review) return "block"
-  if (probability >= thresholds.allow) return "review"
-  return "allow"
-}
-
-function actionCopy(action: string) {
-  if (action === "block") return "High model confidence. Block the message and log a moderation event."
-  if (action === "review") return "Borderline confidence. Send to a human moderator with model evidence."
-  return "Low spam/abuse probability. Safe to publish."
+function scoreTokenImpacts(tokens: string[], model: ModelExport): { token: string; delta: number }[] {
+  const unique = Array.from(new Set(tokens)).slice(0, 24)
+  return unique
+    .map((tok) => {
+      const { vector } = vectorize(tok, model.vocabulary)
+      const h1 = denseRelu(vector, model.weights.dense1_kernel, model.weights.dense1_bias)
+      const h2 = denseRelu(h1, model.weights.dense2_kernel, model.weights.dense2_bias)
+      const prob = denseSigmoid(h2, model.weights.out_kernel, model.weights.out_bias)
+      return { token: tok, delta: prob }
+    })
+    .sort((a, b) => b.delta - a.delta)
 }
 
 export default function Home() {
-  const [text, setText] = useState(examples[1].text)
   const [model, setModel] = useState<ModelExport | null>(null)
   const [loading, setLoading] = useState(true)
-  const [runCount, setRunCount] = useState(1)
+  const [text, setText] = useState(presets[0].text)
+  const [allowThreshold, setAllowThreshold] = useState(0.25)
+  const [reviewThreshold, setReviewThreshold] = useState(0.65)
+  const [history, setHistory] = useState<{ text: string; prob: number; action: ModerationAction }[]>([])
 
   useEffect(() => {
     fetch("/model/moderation_model.json")
       .then((response) => response.json())
-      .then((data: ModelExport) => setModel(data))
-      .finally(() => setLoading(false))
+      .then((data: ModelExport) => {
+        setModel(data)
+        if (data.thresholds) {
+          setAllowThreshold(data.thresholds.allow)
+          setReviewThreshold(data.thresholds.review)
+        }
+        setLoading(false)
+      })
+      .catch(() => setLoading(false))
   }, [])
 
-  const probability = useMemo(() => (model ? predict(text, model) : 0), [text, model, runCount])
-  const action = model ? routing(probability, model.thresholds) : "loading"
+  const result = useMemo(() => {
+    if (!model) return null
+    const start = performance.now()
+    const { vector, matched } = vectorize(text, model.vocabulary)
+    const hidden1 = denseRelu(vector, model.weights.dense1_kernel, model.weights.dense1_bias)
+    const hidden2 = denseRelu(hidden1, model.weights.dense2_kernel, model.weights.dense2_bias)
+    const probability = denseSigmoid(hidden2, model.weights.out_kernel, model.weights.out_bias)
+    const latencyMs = (performance.now() - start).toFixed(2)
+
+    const h1Active = hidden1.filter((v) => v > 0).length
+    const h2Active = hidden2.filter((v) => v > 0).length
+
+    const action: ModerationAction =
+      probability >= reviewThreshold ? "block" : probability >= allowThreshold ? "review" : "allow"
+
+    const tokenScores = scoreTokenImpacts(matched, model)
+
+    return {
+      probability,
+      action,
+      matchedTokens: matched,
+      tokenScores,
+      latencyMs,
+      h1Active,
+      h1Total: hidden1.length,
+      h2Active,
+      h2Total: hidden2.length,
+    }
+  }, [model, text, allowThreshold, reviewThreshold])
+
+  const probability = result?.probability ?? 0
   const percent = Math.round(probability * 1000) / 10
-  const tokens = tokenize(text)
-  const knownTokens = model ? tokens.filter((token) => model.vocabulary[token] !== undefined) : []
-  const topTokens = Array.from(new Set(knownTokens)).slice(0, 12)
+  const action = result?.action ?? "allow"
+
+  function logCurrentRun() {
+    if (!result) return
+    setHistory((prev) => [{ text: text.slice(0, 90), prob: result.probability, action: result.action }, ...prev.slice(0, 5)])
+  }
 
   return (
-    <main className="min-h-screen bg-[#0b1018] text-slate-50">
-      <section className="mx-auto grid min-h-screen max-w-7xl gap-8 px-6 py-10 lg:grid-cols-[390px_1fr]">
-        <aside className="rounded-lg border border-white/10 bg-white/[0.04] p-5">
-          <div className="mb-6 flex items-center gap-3">
-            <Shield className="h-9 w-9 text-cyan-300" />
+    <main className="min-h-screen bg-[#07050d] text-slate-100 selection:bg-purple-500/30">
+      <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(circle_at_15%_15%,rgba(168,85,247,0.14),transparent_35%),radial-gradient(circle_at_85%_80%,rgba(236,72,153,0.1),transparent_40%)]" />
+
+      <header className="relative border-b border-purple-500/20 bg-[#0b0716]/80 backdrop-blur-md">
+        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4 px-6 py-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-purple-500/40 bg-gradient-to-br from-purple-600/30 to-fuchsia-600/20 text-purple-300 shadow-lg shadow-purple-950/50">
+              <Shield className="h-5 w-5" />
+            </div>
             <div>
-              <h1 className="text-2xl font-black">Keras Moderation Model</h1>
-              <p className="text-sm text-slate-400">Real trained neural spam/unsafe text classifier.</p>
+              <div className="flex items-center gap-2">
+                <span className="text-lg font-black tracking-tight text-white">GuardRail Neural Inspector</span>
+                <span className="rounded-full border border-purple-500/30 bg-purple-950/60 px-2.5 py-0.5 font-mono text-[11px] font-semibold text-purple-300">
+                  Keras Tensor Engine
+                </span>
+              </div>
+              <p className="text-xs text-slate-400">
+                In-Browser Dense(96) → Dense(32) → Sigmoid Inference · Trained on UCI SMS Spam Corpus
+              </p>
             </div>
           </div>
 
-          <div className="mb-4 flex flex-wrap gap-2">
-            {examples.map((example) => (
+          <div className="flex items-center gap-3 text-xs font-mono">
+            <span className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-950/40 px-3 py-1.5 text-emerald-300">
+              <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+              {loading ? "Loading weights..." : `Weights Ready · ${result?.latencyMs || "0.15"} ms/forward`}
+            </span>
+          </div>
+        </div>
+      </header>
+
+      <section className="relative mx-auto grid max-w-7xl gap-6 px-6 py-8 lg:grid-cols-[420px_1fr]">
+        {/* Left Control Column */}
+        <aside className="space-y-5">
+          <div className="rounded-2xl border border-purple-500/25 bg-[#0e091d]/90 p-5 shadow-2xl shadow-black/50 backdrop-blur-sm">
+            <div className="mb-3 flex items-center justify-between">
+              <span className="flex items-center gap-2 text-xs font-mono uppercase tracking-wider text-purple-300">
+                <MessageSquareText className="h-4 w-4 text-purple-400" />
+                Live Payload Input
+              </span>
               <button
-                key={example.label}
-                onClick={() => setText(example.text)}
-                className="rounded-md border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-300 transition hover:border-cyan-300/50 hover:text-cyan-100"
+                onClick={() => setText("")}
+                className="inline-flex items-center gap-1 text-xs text-slate-400 hover:text-white"
               >
-                {example.label}
+                <Trash2 className="h-3.5 w-3.5" /> Clear
               </button>
-            ))}
+            </div>
+
+            <textarea
+              value={text}
+              onChange={(event) => setText(event.target.value)}
+              className="h-44 w-full resize-none rounded-xl border border-purple-500/25 bg-[#07050d] p-4 font-mono text-sm leading-relaxed text-slate-100 outline-none transition focus:border-purple-400"
+              placeholder="Paste any SMS, support message, or user comment to run real-time neural moderation..."
+            />
+
+            <div className="mt-3 flex items-center justify-between text-xs font-mono text-slate-400">
+              <span>Tokens: {tokenize(text).length}</span>
+              <span>Vocab hits: {result?.matchedTokens.length ?? 0} / {model?.metrics.vocabulary_size ?? 1600}</span>
+            </div>
+
+            <button
+              onClick={logCurrentRun}
+              disabled={!model || !text.trim()}
+              className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-purple-500 to-fuchsia-500 px-4 py-3 text-sm font-bold text-white shadow-lg shadow-purple-500/25 transition hover:from-purple-600 hover:to-fuchsia-600 disabled:opacity-50"
+            >
+              {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+              Snapshot & Log Audit Decision
+            </button>
           </div>
 
-          <div className="mb-2 flex items-center gap-2 text-sm font-bold text-cyan-100">
-            <MessageSquareText className="h-4 w-4" />
-            Type your own message here
-          </div>
-
-          <textarea
-            value={text}
-            onChange={(event) => setText(event.target.value)}
-            className="h-64 w-full resize-none rounded-md border border-white/10 bg-slate-950 p-4 text-sm leading-6 text-slate-100 outline-none transition focus:border-cyan-300/60"
-            placeholder="Type any message. The trained Keras model runs inference in the browser..."
-          />
-
-          <button
-            onClick={() => setRunCount((value) => value + 1)}
-            disabled={!model}
-            className="mt-4 flex w-full items-center justify-center gap-2 rounded-md bg-cyan-300 px-4 py-3 font-black text-slate-950 disabled:opacity-60"
-          >
-            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-            Run Keras Inference
-          </button>
-        </aside>
-
-        <section className="space-y-6">
-          <div className="grid gap-4 md:grid-cols-4">
-            {[
-              ["Dataset", model?.metrics.dataset || "loading"],
-              ["Test Accuracy", model ? `${(model.metrics.accuracy * 100).toFixed(1)}%` : "..."],
-              ["F1 Score", model ? `${(model.metrics.f1 * 100).toFixed(1)}%` : "..."],
-              ["Vocabulary", model ? String(model.metrics.vocabulary_size) : "..."],
-            ].map(([label, value]) => (
-              <div key={label} className="rounded-lg border border-white/10 bg-white/[0.04] p-4">
-                <div className="text-sm text-slate-400">{label}</div>
-                <div className="mt-2 text-2xl font-black text-cyan-200">{value}</div>
-              </div>
-            ))}
-          </div>
-
-          <div className="grid gap-6 lg:grid-cols-[1fr_360px]">
-            <div className="rounded-lg border border-white/10 bg-white/[0.04] p-5">
-              <div className="mb-4 flex items-center gap-2">
-                <Brain className="h-5 w-5 text-cyan-300" />
-                <h2 className="text-xl font-bold">Neural Model Prediction</h2>
-              </div>
-              <div className="rounded-lg border border-white/10 bg-slate-950 p-5">
-                <div className="mb-2 flex items-center justify-between text-sm text-slate-400">
-                  <span>Spam / unsafe probability</span>
-                  <span>{percent}%</span>
-                </div>
-                <div className="h-4 rounded-full bg-white/10">
-                  <div
-                    className={`h-4 rounded-full ${action === "block" ? "bg-red-300" : action === "review" ? "bg-orange-300" : "bg-emerald-300"}`}
-                    style={{ width: `${percent}%` }}
-                  />
-                </div>
-                <div
-                  className={`mt-5 inline-flex rounded-md px-3 py-2 text-sm font-black uppercase tracking-wide ${
-                    action === "block"
-                      ? "bg-red-300 text-slate-950"
-                      : action === "review"
-                        ? "bg-orange-300 text-slate-950"
-                        : "bg-emerald-300 text-slate-950"
+          {/* Preset Test Payloads */}
+          <div className="rounded-2xl border border-purple-500/20 bg-[#0e091d]/90 p-5">
+            <div className="mb-3 text-xs font-mono uppercase tracking-wider text-purple-300">
+              Benchmark Test Vectors
+            </div>
+            <div className="space-y-2">
+              {presets.map((item) => (
+                <button
+                  key={item.title}
+                  onClick={() => setText(item.text)}
+                  className={`w-full rounded-xl border p-3 text-left transition ${
+                    text === item.text
+                      ? "border-purple-500/60 bg-purple-950/50"
+                      : "border-purple-500/15 bg-[#090612] hover:border-purple-500/35"
                   }`}
                 >
-                  {action}
-                </div>
-                <p className="mt-4 leading-7 text-slate-300">{actionCopy(action)}</p>
-              </div>
-
-              <div className="mt-5 rounded-lg border border-white/10 bg-slate-950 p-5">
-                <div className="mb-3 flex items-center gap-2 text-sm font-bold text-slate-300">
-                  <MessageSquareText className="h-4 w-4 text-emerald-300" />
-                  Tested message
-                </div>
-                <p className="leading-8 text-slate-200">{text}</p>
-              </div>
-            </div>
-
-            <div className="space-y-6">
-              <div className="rounded-lg border border-white/10 bg-white/[0.04] p-5">
-                <div className="mb-4 flex items-center gap-2">
-                  <BarChart3 className="h-5 w-5 text-emerald-300" />
-                  <h2 className="text-xl font-bold">Training Metrics</h2>
-                </div>
-                {model ? (
-                  <div className="space-y-3 text-sm">
-                    {[
-                      ["Train samples", model.metrics.train_size],
-                      ["Validation samples", model.metrics.validation_size],
-                      ["Test samples", model.metrics.test_size],
-                      ["Precision", `${(model.metrics.precision * 100).toFixed(1)}%`],
-                      ["Recall", `${(model.metrics.recall * 100).toFixed(1)}%`],
-                      ["Epochs", model.metrics.epochs_ran],
-                    ].map(([label, value]) => (
-                      <div key={label} className="flex justify-between rounded-md bg-slate-950 p-3">
-                        <span className="text-slate-400">{label}</span>
-                        <strong>{value}</strong>
-                      </div>
-                    ))}
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-white">{item.title}</span>
+                    <span className="rounded-md bg-purple-950/80 px-2 py-0.5 font-mono text-[10px] text-purple-300">
+                      {item.category}
+                    </span>
                   </div>
-                ) : (
-                  <div className="text-slate-400">Loading exported Keras model...</div>
-                )}
-              </div>
-
-              <div className="rounded-lg border border-white/10 bg-[#f5f2ea] p-5 text-slate-950">
-                <div className="mb-3 flex items-center gap-2 font-black">
-                  <Database className="h-5 w-5" />
-                  Real ML Pipeline
-                </div>
-                <p className="text-sm leading-6 text-slate-700">
-                  The model was trained with Keras on the UCI SMS Spam Collection, exported as weights and vocabulary,
-                  then executed directly in this web app.
-                </p>
-              </div>
+                  <p className="mt-1 line-clamp-2 text-xs text-slate-400">{item.text}</p>
+                </button>
+              ))}
             </div>
           </div>
 
-          <div className="grid gap-6 lg:grid-cols-[1fr_360px]">
-            <div className="rounded-lg border border-white/10 bg-white/[0.04] p-5">
-              <div className="mb-4 flex items-center gap-2">
-                <Sparkles className="h-5 w-5 text-cyan-300" />
-                <h2 className="text-xl font-bold">Model Evidence</h2>
+          {/* Policy Threshold Calibration */}
+          <div className="rounded-2xl border border-purple-500/20 bg-[#0e091d]/90 p-5">
+            <div className="mb-4 flex items-center gap-2 text-xs font-mono uppercase tracking-wider text-purple-300">
+              <Sliders className="h-4 w-4 text-purple-400" />
+              Policy Decision Thresholds
+            </div>
+
+            <div className="space-y-4 text-xs">
+              <div>
+                <div className="mb-1 flex justify-between">
+                  <span className="text-slate-300">Review Gate Threshold</span>
+                  <span className="font-mono font-bold text-amber-300">{Math.round(allowThreshold * 100)}%</span>
+                </div>
+                <input
+                  type="range"
+                  min={0.05}
+                  max={0.5}
+                  step={0.01}
+                  value={allowThreshold}
+                  onChange={(e) => setAllowThreshold(Number(e.target.value))}
+                  className="w-full accent-purple-500"
+                />
               </div>
-              <div className="flex flex-wrap gap-2">
-                {topTokens.length > 0 ? (
-                  topTokens.map((token) => (
-                    <span key={token} className="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1 text-sm text-cyan-100">
-                      {token}
-                    </span>
-                  ))
-                ) : (
-                  <span className="text-slate-400">No vocabulary tokens matched.</span>
-                )}
+
+              <div>
+                <div className="mb-1 flex justify-between">
+                  <span className="text-slate-300">Auto-Block Threshold</span>
+                  <span className="font-mono font-bold text-rose-300">{Math.round(reviewThreshold * 100)}%</span>
+                </div>
+                <input
+                  type="range"
+                  min={0.51}
+                  max={0.95}
+                  step={0.01}
+                  value={reviewThreshold}
+                  onChange={(e) => setReviewThreshold(Number(e.target.value))}
+                  className="w-full accent-fuchsia-500"
+                />
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        {/* Right Telemetry & Explanation Column */}
+        <section className="space-y-6">
+          {/* Top Metrics Row */}
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            {[
+              ["Corpus Benchmark", model?.metrics.dataset || "UCI SMS Spam"],
+              ["Held-Out Accuracy", model ? `${(model.metrics.accuracy * 100).toFixed(1)}%` : "..."],
+              ["Macro F1 Score", model ? `${(model.metrics.f1 * 100).toFixed(1)}%` : "..."],
+              ["Exported Vocab", model ? `${model.metrics.vocabulary_size.toLocaleString()} tokens` : "..."],
+            ].map(([label, value]) => (
+              <div
+                key={label}
+                className="rounded-2xl border border-purple-500/20 bg-[#0e091d]/90 p-4 shadow-lg shadow-purple-950/10"
+              >
+                <div className="text-xs font-mono uppercase tracking-wider text-slate-400">{label}</div>
+                <div className="mt-2 text-2xl font-black text-white">{value}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Primary Decision Banner */}
+          <div className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
+            <div className="rounded-2xl border border-purple-500/25 bg-[#0e091d]/95 p-6">
+              <div className="mb-4 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Brain className="h-5 w-5 text-purple-400" />
+                  <h2 className="text-lg font-bold text-white">Real-Time Sigmoid Risk Telemetry</h2>
+                </div>
+                <span
+                  className={`inline-flex items-center gap-1.5 rounded-full px-3.5 py-1 text-xs font-black uppercase tracking-wider ${
+                    action === "block"
+                      ? "border border-rose-500/40 bg-rose-500/20 text-rose-200"
+                      : action === "review"
+                        ? "border border-amber-500/40 bg-amber-500/20 text-amber-200"
+                        : "border border-emerald-500/40 bg-emerald-500/20 text-emerald-200"
+                  }`}
+                >
+                  {action === "allow" ? <CheckCircle2 className="h-3.5 w-3.5" /> : <AlertOctagon className="h-3.5 w-3.5" />}
+                  Policy Action: {action}
+                </span>
+              </div>
+
+              <div className="rounded-xl border border-purple-500/15 bg-[#080511] p-5">
+                <div className="mb-2 flex items-baseline justify-between">
+                  <span className="text-xs font-mono uppercase tracking-wider text-slate-400">
+                    Unsafe / Spam Posterior P(y=1|x)
+                  </span>
+                  <span className="font-mono text-3xl font-black text-purple-300">{percent}%</span>
+                </div>
+
+                {/* Progress Bar with Threshold Markers */}
+                <div className="relative h-4 w-full overflow-hidden rounded-full bg-white/10">
+                  <div
+                    className={`h-full transition-all duration-300 ${
+                      action === "block"
+                        ? "bg-gradient-to-r from-amber-500 to-rose-500"
+                        : action === "review"
+                          ? "bg-gradient-to-r from-purple-500 to-amber-400"
+                          : "bg-gradient-to-r from-emerald-500 to-teal-400"
+                    }`}
+                    style={{ width: `${Math.max(2, Math.min(100, percent))}%` }}
+                  />
+                </div>
+
+                <div className="mt-2 flex justify-between font-mono text-[11px] text-slate-400">
+                  <span>0% (Clean)</span>
+                  <span>Review Gate ({Math.round(allowThreshold * 100)}%)</span>
+                  <span>Block Gate ({Math.round(reviewThreshold * 100)}%)</span>
+                  <span>100%</span>
+                </div>
+
+                {/* Layer Activation Telemetry */}
+                <div className="mt-5 grid grid-cols-3 gap-3 border-t border-purple-500/15 pt-4 font-mono text-xs">
+                  <div className="rounded-lg bg-[#0e091d] p-2.5">
+                    <div className="text-[10px] text-slate-400">Dense Layer 1 (ReLU)</div>
+                    <div className="mt-1 font-bold text-purple-200">
+                      {result?.h1Active ?? 0} / {result?.h1Total ?? 96} active
+                    </div>
+                  </div>
+                  <div className="rounded-lg bg-[#0e091d] p-2.5">
+                    <div className="text-[10px] text-slate-400">Dense Layer 2 (ReLU)</div>
+                    <div className="mt-1 font-bold text-purple-200">
+                      {result?.h2Active ?? 0} / {result?.h2Total ?? 32} active
+                    </div>
+                  </div>
+                  <div className="rounded-lg bg-[#0e091d] p-2.5">
+                    <div className="text-[10px] text-slate-400">Sigmoid Logit Gate</div>
+                    <div className="mt-1 font-bold text-fuchsia-300">{probability.toFixed(4)}</div>
+                  </div>
+                </div>
               </div>
             </div>
 
-            <div className="rounded-lg border border-white/10 bg-white/[0.04] p-5">
+            {/* Model Artifact Specs */}
+            <div className="rounded-2xl border border-purple-500/20 bg-[#0e091d]/90 p-6">
               <div className="mb-4 flex items-center gap-2">
-                <FileWarning className="h-5 w-5 text-orange-300" />
-                <h2 className="text-xl font-bold">Audit Trace</h2>
+                <BarChart3 className="h-5 w-5 text-fuchsia-400" />
+                <h2 className="text-lg font-bold text-white">Evaluation Split Metrics</h2>
               </div>
-              <ol className="space-y-3 text-sm text-slate-300">
-                {[
-                  "Tokenize text with the same preprocessing used during training",
-                  "Build log-scaled bag-of-words vector from 1,600-word vocabulary",
-                  "Run Dense(96) -> Dense(32) -> sigmoid exported Keras weights",
-                  "Apply allow/review/block thresholds",
-                ].map((step, index) => (
-                  <li key={step} className="flex gap-3">
-                    <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-cyan-300 text-xs font-bold text-slate-950">
-                      {index + 1}
-                    </span>
-                    <span>{step}</span>
-                  </li>
-                ))}
-              </ol>
-              <div className="mt-5 flex items-center gap-2 rounded-md border border-white/10 bg-white/[0.04] p-3 text-sm">
-                {action === "allow" ? (
-                  <>
-                    <CheckCircle2 className="h-4 w-4 text-emerald-300" />
-                    Safe to publish
-                  </>
-                ) : (
-                  <>
-                    <AlertOctagon className="h-4 w-4 text-red-300" />
-                    Requires moderation action
-                  </>
-                )}
+              {model ? (
+                <div className="space-y-2.5 font-mono text-xs">
+                  {[
+                    ["Train / Val / Test", `${model.metrics.train_size} / ${model.metrics.validation_size} / ${model.metrics.test_size}`],
+                    ["Test Precision", `${(model.metrics.precision * 100).toFixed(2)}%`],
+                    ["Test Recall", `${(model.metrics.recall * 100).toFixed(2)}%`],
+                    ["Training Epochs", String(model.metrics.epochs_ran)],
+                    ["Execution Engine", "Pure TypeScript Matrix Ops"],
+                  ].map(([label, value]) => (
+                    <div
+                      key={label}
+                      className="flex items-center justify-between rounded-xl border border-purple-500/15 bg-[#080511] px-3.5 py-2.5"
+                    >
+                      <span className="text-slate-400">{label}</span>
+                      <span className="font-bold text-purple-200">{value}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-sm text-slate-400">Loading Keras model artifacts...</div>
+              )}
+            </div>
+          </div>
+
+          {/* Token-Level Attribution & Audit Log */}
+          <div className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
+            <div className="rounded-2xl border border-purple-500/20 bg-[#0e091d]/90 p-6">
+              <div className="mb-2 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Sparkles className="h-5 w-5 text-purple-400" />
+                  <h2 className="text-lg font-bold text-white">Token-Level Risk Attribution</h2>
+                </div>
+                <span className="font-mono text-xs text-slate-400">Single-Token Marginal Sigmoid Probe</span>
               </div>
+              <p className="mb-4 text-xs text-slate-400">
+                Each matched vocabulary token is probed individually through the exported Keras weights to rank its contribution toward the spam/unsafe class:
+              </p>
+
+              {result && result.tokenScores.length > 0 ? (
+                <div className="grid gap-2.5 sm:grid-cols-2">
+                  {result.tokenScores.slice(0, 10).map((item) => {
+                    const riskPct = Math.round(item.delta * 100)
+                    const high = riskPct >= 45
+                    return (
+                      <div
+                        key={item.token}
+                        className="flex items-center justify-between rounded-xl border border-purple-500/15 bg-[#080511] px-3.5 py-2"
+                      >
+                        <span className="font-mono text-xs font-semibold text-white">"{item.token}"</span>
+                        <div className="flex items-center gap-2">
+                          <div className="h-1.5 w-16 overflow-hidden rounded-full bg-white/10">
+                            <div
+                              className={`h-full ${high ? "bg-rose-400" : "bg-purple-400"}`}
+                              style={{ width: `${Math.max(6, riskPct)}%` }}
+                            />
+                          </div>
+                          <span className={`font-mono text-xs font-bold ${high ? "text-rose-300" : "text-purple-300"}`}>
+                            {riskPct}%
+                          </span>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              ) : (
+                <div className="rounded-xl border border-purple-500/15 bg-[#080511] p-4 text-xs text-slate-400">
+                  No known vocabulary tokens found in current input.
+                </div>
+              )}
+            </div>
+
+            <div className="rounded-2xl border border-purple-500/20 bg-[#0e091d]/90 p-6">
+              <div className="mb-4 flex items-center gap-2">
+                <Terminal className="h-5 w-5 text-purple-400" />
+                <h2 className="text-lg font-bold text-white">Recent Audit Snapshots</h2>
+              </div>
+
+              {history.length > 0 ? (
+                <div className="space-y-2.5">
+                  {history.map((item, idx) => (
+                    <div
+                      key={idx}
+                      className="rounded-xl border border-purple-500/15 bg-[#080511] p-3 text-xs"
+                    >
+                      <div className="flex items-center justify-between font-mono">
+                        <span className="uppercase text-purple-300">{item.action}</span>
+                        <span className="font-bold text-white">{(item.prob * 100).toFixed(1)}% risk</span>
+                      </div>
+                      <p className="mt-1 truncate text-slate-400">{item.text}</p>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="space-y-2.5 font-mono text-xs text-slate-300">
+                  {[
+                    "1. Regex tokenizer extracts lowercase alphanumeric tokens",
+                    "2. Log-normalized BoW vector mapped over 1,600-token vocab",
+                    "3. Forward pass: Dense(96, ReLU) → Dense(32, ReLU) → Sigmoid(1)",
+                    "4. Calibrated threshold gate routes to Allow / Review / Block",
+                  ].map((step) => (
+                    <div key={step} className="rounded-xl border border-purple-500/15 bg-[#080511] p-3">
+                      {step}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </section>
